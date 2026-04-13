@@ -1,0 +1,189 @@
+---
+title: "Bayesian Logistic Regression"
+author: "Fedor Bentsa"
+date: "2026-04-13"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(jsonlite)
+library(lubridate)
+library(rstanarm)
+library(bayesplot)
+
+options(mc.cores = parallel::detectCores())
+```
+
+## Load and prepare data
+
+```{r}
+movies <- read.csv("tmdb_5000_movies.csv", stringsAsFactors = FALSE)
+
+movies <- movies %>%
+  select(
+    title,
+    budget,
+    revenue,
+    runtime,
+    popularity,
+    genres,
+    release_date,
+    original_language,
+    vote_average,
+    vote_count
+  )
+
+movies <- movies %>%
+  filter(
+    !is.na(budget),
+    !is.na(revenue),
+    !is.na(runtime),
+    !is.na(popularity),
+    !is.na(genres),
+    !is.na(release_date),
+    budget > 0,
+    revenue >= 0,
+    runtime > 0,
+    popularity > 0
+  ) %>%
+  mutate(
+    success = ifelse(revenue > budget, 1, 0),
+    release_date = ymd(release_date),
+    release_month = month(release_date),
+    is_english = ifelse(original_language == "en", 1, 0),
+    log_budget = log(budget),
+    log_popularity = log(popularity + 1)
+  ) %>%
+  filter(!is.na(release_month))
+
+dim(movies)
+head(movies[, c("title", "budget", "revenue", "success")])
+```
+
+## Extract genre information
+
+```{r}
+extract_genres <- function(genre_string) {
+  out <- tryCatch({
+    if (is.na(genre_string) || genre_string == "") return(character(0))
+    parsed <- fromJSON(genre_string)
+    if (!is.data.frame(parsed)) return(character(0))
+    if (!("name" %in% names(parsed))) return(character(0))
+    as.character(parsed$name)
+  }, error = function(e) character(0))
+  
+  return(out)
+}
+
+genre_list <- lapply(movies$genres, extract_genres)
+all_genres <- unlist(genre_list)
+top_genres <- names(sort(table(all_genres), decreasing = TRUE))[1:5]
+
+top_genres
+```
+
+## Create genre dummy variables
+
+```{r}
+for (g in top_genres) {
+  clean_name <- paste0("genre_", gsub("[^A-Za-z0-9]", "_", tolower(g)))
+  movies[[clean_name]] <- sapply(genre_list, function(x) as.integer(g %in% x))
+}
+
+model_data <- movies %>%
+  select(
+    success,
+    log_budget,
+    log_popularity,
+    runtime,
+    release_month,
+    is_english,
+    starts_with("genre_")
+  ) %>%
+  drop_na() %>%
+  mutate(
+    log_budget = as.numeric(scale(log_budget)),
+    log_popularity = as.numeric(scale(log_popularity)),
+    runtime = as.numeric(scale(runtime)),
+    release_month = as.numeric(scale(release_month))
+  )
+
+head(model_data)
+```
+
+## Split into training and testing sets
+
+```{r}
+set.seed(4420)
+
+n <- nrow(model_data)
+train_index <- sample(1:n, size = floor(0.8 * n))
+
+train_data <- model_data[train_index, ]
+test_data <- model_data[-train_index, ]
+
+dim(train_data)
+dim(test_data)
+```
+
+## Fit Bayesian logistic regression
+
+```{r}
+bayes_model <- stan_glm(
+  success ~ .,
+  data = train_data,
+  family = binomial(link = "logit"),
+  prior = normal(0, 2.5, autoscale = TRUE),
+  prior_intercept = normal(0, 5, autoscale = TRUE),
+  chains = 4,
+  iter = 2000,
+  seed = 4420,
+  refresh = 0
+)
+
+summary(bayes_model)
+```
+
+## Posterior intervals
+
+```{r}
+posterior_interval(bayes_model, prob = 0.95)
+```
+
+## Test set predictions
+
+```{r}
+posterior_probs <- posterior_linpred(
+  bayes_model,
+  newdata = test_data,
+  transform = TRUE
+)
+
+mean_probs <- colMeans(posterior_probs)
+pred_class <- ifelse(mean_probs >= 0.5, 1, 0)
+
+accuracy <- mean(pred_class == test_data$success)
+cat("Test Accuracy:", round(accuracy, 4), "\n")
+
+conf_mat <- table(
+  Predicted = pred_class,
+  Actual = test_data$success
+)
+
+conf_mat
+```
+
+## Posterior plot
+
+```{r}
+posterior <- as.matrix(bayes_model)
+
+mcmc_areas(
+  posterior,
+  pars = colnames(posterior)[1:min(8, ncol(posterior))],
+  prob = 0.8
+)
+```
